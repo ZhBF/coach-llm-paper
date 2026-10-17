@@ -26,7 +26,7 @@
 % ---------------------------------------------------------------------
 \newcommand{\Hst}{\mathcal{H}}           % hypothesis history
 \newcommand{\Est}{\mathcal{E}}           % evidence log
-\newcommand{\Mst}{\mathcal{M}}           % shared memory
+\newcommand{\Mst}{\mathcal{M}}           % memory of a chain
 \newcommand{\opp}{\mathcal{O}}           % opponent pool
 \newcommand{\reg}{\mathcal{R}}           % metric registry
 \newcommand{\E}{\mathbb{E}}
@@ -168,7 +168,7 @@ A Coach $\Gamma$ maps the chain's history to the next version, so that a chain i
   \qquad
   H^{(t)} = \operatorname{fold}\bigl(\Gamma,\, H^{(0)},\, [e^{(1)},\dots,e^{(t)}]\bigr),
 \end{equation}
-where $e^{(t)}$ is the evidence record of round $t$, obtained by training $H^{(t-1)}$, and $\Mst_t$ is the shared memory at the time of the revision.
+where $e^{(t)}$ is the evidence record of round $t$, obtained by training $H^{(t-1)}$, and $\Mst_t$ is the memory of the chain at the time of the revision.
 Throughout, calligraphic letters $\Hst$, $\Est$ and $\Mst$ denote the stores, a subscript on a store denotes its state at a given round, and a superscript $(t)$ on a record denotes the round it belongs to.
 Path dependence is a feature rather than a defect: the order in which evidence arrives shapes the refinement, and we test its effect explicitly (\cref{sec:protocol}).
 After each round, a chain takes one of three exits, two of which are terminal,
@@ -220,8 +220,8 @@ Every design decision below is made under this constraint.
 
 \node[store] (E) at ($(rev)!0.5!(fb)+(0,-19mm)$) {Evidence\\ log};
 \node[store, left=5mm of E] (H) {Hypothesis\\ history};
-\node[store, right=5mm of E] (M) {Shared\\ memory};
-\node[draw, dashed, gray, rounded corners, fit=(H)(E)(M), inner sep=3pt, label={[font=\scriptsize, gray]below:append-only, shared by all chains}] (S) {};
+\node[store, right=5mm of E] (M) {Memory};
+\node[draw, dashed, gray, rounded corners, fit=(H)(E)(M), inner sep=3pt, label={[font=\scriptsize, gray]below:append-only, one set per chain}] (S) {};
 \draw[darr] (rev.south) |- ($(S.north)+(-12mm,3mm)$) -- ($(S.north)+(-12mm,0)$);
 \draw[darr] (fb.south) |- ($(S.north)+(12mm,3mm)$) -- ($(S.north)+(12mm,0)$);
 \end{tikzpicture}
@@ -242,11 +242,13 @@ Three append-only stores carry all state across rounds.
     Each entry points to its \code{parent}, so a chain is a path through $\Hst$, and the diff between adjacent versions is the revision record.
     No separate belief base or revision log is kept.
   \item \textbf{Evidence log} $\Est$ holds one evidence record per training run, linking an objective specification to its measured outcome and diagnosis.
-  \item \textbf{Shared memory} $\Mst$ starts empty and accumulates knowledge that belongs to no single hypothesis: procedural lessons (a metric that cannot be compiled, a condition that never fires) and regularities about the environment that recur across tactics.
-    It is the only channel through which one chain informs another.
+  \item \textbf{Memory} $\Mst$ starts empty and accumulates knowledge that belongs to no single version of the hypothesis: procedural lessons (a metric that cannot be compiled, a condition that never fires) and regularities about the environment that the chain has observed.
     Unlike $\Hst$ and $\Est$, $\Mst$ records what is \emph{currently believed} rather than what happened; its entries are induced from noisy evidence and may be wrong, so an entry can be superseded by a later one.
     Superseded entries remain for audit but are excluded from prompts.
 \end{itemize}
+Chains do not interact.
+Each chain has its own three stores, so the Coach of one chain never sees the hypotheses, evidence or memory of another, and chains can be analyzed as independent replications of the method.
+They share only the frozen artifacts: \code{env\_spec}, the registry, $\pi_0$, the opponent pools and the control runs.
 
 Two artifacts are fixed for an entire campaign.
 The \emph{environment specification} \code{env\_spec} declares what the environment supports (offside, goalkeeper, out-of-bounds, penalty area, players per side, \dots); it is a property of the environment and is stated once rather than per hypothesis.
@@ -266,7 +268,7 @@ Replay is what allows an ablation that changes only the Coach to be rerun on exi
 \subsection{Tactical Hypothesis and Prediction Commitment}
 \label{sec:hypothesis}
 
-At the start of each round, the Coach reads every version and every evidence record of the chain, together with the active entries of the shared memory $\Mst$, and writes a new \code{HypothesisEntry} to $\Hst$.
+At the start of each round, the Coach reads every version and every evidence record of the chain, together with the active entries of its memory $\Mst$, and writes a new \code{HypothesisEntry} to $\Hst$.
 
 Seeds of round 0 are specified in advance, with \code{parent} set to null; every later version is derived by the Coach from the tail of the chain.
 \Cref{tab:fields} lists the fields of an entry and when each is filled; the schema is given in \cref{app:schemas}.
@@ -334,7 +336,6 @@ Compared against outcomes, they yield for each chain the prediction accuracy cur
 \paragraph{The role of $M$.}
 $M$ is the field that the mediator directly tests and that the \code{revise\_mechanism} operator acts on.
 It belongs to its chain and evolves with it (narrowing $C$ usually forces a matching change in $M$), and it is never lifted into $\Mst$ on its own.
-A mechanistic finding is promoted to $\Mst$ only once the same anomaly has appeared on at least two chains, at which point it no longer belongs to any single hypothesis.
 We write $M$ as an explicit causal chain (e.g.\ \emph{pressing intensity $\uparrow$ $\to$ opponent errors in back passes $\uparrow$ $\to$ high turnovers $\uparrow$}), whose intermediate quantity is what $O^{\mathrm{med}}$ measures, so that a failure can be localized to a specific link without the cost of a full structural causal model.
 
 The output format is enforced by constrained decoding against the entry schema.
@@ -425,6 +426,11 @@ It is trained again on fresh training seeds, and its evidence record lists the e
 Reusing the earlier record would count the same data twice, and two identical records with correct predictions would satisfy the convergence criterion of \cref{sec:control} without any new evidence.
 The hash is still used to reuse evaluations that depend only on the objective: those of $\pi_0$ and of the control runs (\cref{sec:adapt}).
 
+\paragraph{Recompiling after a translation failure.}
+A diagnosis of \code{translation\_failure} (\cref{sec:feedback}) leaves the belief unchanged, but training the same objective again would repeat the failure.
+The next version is therefore compiled with the failed objective given as a violation, and its objective hash must differ from that one.
+Unless a condition operator was used, the condition stays as compiled for the parent, so what changes is the potential.
+
 % ---------------------------------------------------------------------
 \subsection{Policy Adaptation and Evaluation}
 \label{sec:adapt}
@@ -472,8 +478,6 @@ Together they separate ``learned something, but not the intended thing'' from ``
     A coevolving opponent would make rounds incomparable, since more match points might only reflect a weaker opponent.
     It would also shift the distribution of opponent states on which conditions and the calibration of the gates rest: an opponent that shares the shaping executes the tactic too, so a condition such as ``the opponent is compact'' would fire less and less often as training proceeds.
     Comparability across rounds is the premise of the refinement mechanism; robustness to adapting opponents is tested separately, on converged rules only (\cref{sec:confirm}).
-  \item \textbf{Tiered budget.} A screening tier uses one fifth of the step budget and one seed, looking only at the execution trend and the early slope of benefit; a confirmation tier uses the full budget and multiple seeds.
-  \item \textbf{Reduced scenarios} for screening (e.g.\ a 3v3 situation in the attacking third), with full matches reserved for confirmation, contingent on simulator support.
 \end{itemize}
 
 % ---------------------------------------------------------------------
@@ -514,26 +518,27 @@ Execution therefore gates everything: if our side did not do what the tactic ask
 
 \begin{table}[t]
 \centering\small
-\caption{Programmatic diagnosis. Rules are applied top to bottom. Directions are relative to the hypothesis: \pUp\ means that the quantity moved the way $H$ claims, and ``$\neg\pUp$'' means \pFlat\ or \pDown. Only the first three rows are evidence about the hypothesis; the rest concern the environment or the pipeline and are routed to the shared memory as candidate entries.}
+\caption{Programmatic diagnosis. Rules are applied top to bottom. Directions are relative to the hypothesis: \pUp\ means that the quantity moved the way $H$ claims, and ``$\neg\pUp$'' means \pFlat\ or \pDown. Only rows 1--3 are evidence about the hypothesis; the other rows concern the environment or the pipeline and say how the next round must change, without changing the belief.}
 \label{tab:diagnosis}
 \begin{tabularx}{\linewidth}{@{}c c c c l X@{}}
 \toprule
-& exe & med & ben & Diagnosis & Routed to \\
+& exe & med & ben & Diagnosis & Next step \\
 \midrule
-0 & \multicolumn{3}{c}{seeds disagree / not converged} & \code{inconclusive} & shared memory \\
+0 & \multicolumn{3}{c}{seeds disagree / not converged} & \code{inconclusive} & replicate on fresh seeds \\
 \midrule
-1 & \pUp & \pUp & \pUp & \code{belief\_supported} & chain \\
-2 & \pUp & \pUp & $\neg\pUp$ & \code{belief\_disconfirmed\_value} & chain; the only case counting toward retirement \\
-3 & \pUp & $\neg\pUp$ & any & \code{belief\_disconfirmed\_mechanism} & chain; prefer \code{revise\_mechanism} \\
+1 & \pUp & \pUp & \pUp & \code{belief\_supported} & revise the belief \\
+2 & \pUp & \pUp & $\neg\pUp$ & \code{belief\_disconfirmed\_value} & revise the belief; the only case counting toward retirement \\
+3 & \pUp & $\neg\pUp$ & any & \code{belief\_disconfirmed\_mechanism} & revise the belief; prefer \code{revise\_mechanism} \\
 \midrule
-4 & $\neg\pUp$ & -- & -- & \code{condition\_too\_rare} \ ($\gbar < \epsilon_g$) & shared memory; widen $C$ \\
-5 & $\neg\pUp$ & -- & -- & \begin{tabular}[t]{@{}l@{}}\code{insufficient\_adaptation}\\ ($\mathrm{KL}_0 < \mathrm{KL}_0^{\mathrm{ctrl}} + \epsilon_{\mathrm{KL}}$)\end{tabular} & shared memory; fix adaptation \\
-6 & $\neg\pUp$ & -- & -- & \code{translation\_failure} \ (otherwise) & shared memory; fix compilation \\
+4 & $\neg\pUp$ & -- & -- & \code{condition\_too\_rare} \ ($\gbar < \epsilon_g$) & widen $C$ \\
+5 & $\neg\pUp$ & -- & -- & \begin{tabular}[t]{@{}l@{}}\code{insufficient\_adaptation}\\ ($\mathrm{KL}_0 < \mathrm{KL}_0^{\mathrm{ctrl}} + \epsilon_{\mathrm{KL}}$)\end{tabular} & none in the loop; reported \\
+6 & $\neg\pUp$ & -- & -- & \code{translation\_failure} \ (otherwise) & recompile (\cref{sec:compile}) \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 The three rows with flat execution are distinguished by \emph{cause}, not by outcome, because each calls for a different repair: a gate that never opened needs a wider condition, a policy that the shaping did not move needs different adaptation hyperparameters, and a policy that moved in the wrong direction needs a different compilation.
+The adaptation settings are fixed before the campaign to keep rounds comparable, so row 5 has no remedy inside the loop: the round is not evidence about the belief, it is reported, and the settings are revised between campaigns.
 Fine-tuning alone already moves the policy away from $\pi_0$, so row 5 compares $\mathrm{KL}_0$ with its mean $\mathrm{KL}_0^{\mathrm{ctrl}}$ over the control runs rather than with zero, and $\epsilon_{\mathrm{KL}}$ is a margin above it.
 Collapsing them would let engineering noise masquerade as belief evidence.
 Row 3 captures a distinct and informative case: our team executed the tactic, but the opponent did not respond as $M$ claims.
@@ -569,7 +574,7 @@ Operator & Effect \\
 \code{revise\_mechanism} & replace one link of the causal chain $M$ (and the corresponding $O^{\mathrm{med}}$) \\
 \code{split} & fork the chain into two versions with complementary, narrower conditions, when evidence shows opposite behavior in different regions \\
 \code{retire} & declare the hypothesis wrong; chain terminates \\
-\code{retract\_memory} & supersede a shared memory entry contradicted by later evidence \\
+\code{retract\_memory} & supersede a memory entry contradicted by later evidence \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -597,9 +602,10 @@ Deductive validation is a semantic judgment and stays with the LLM.
 The failure rate of reference checks is itself a quantitative measure of model capability and is logged for comparisons across LLM backends.
 
 \paragraph{Memory writes.}
-The four diagnoses in \cref{tab:diagnosis} that are not about belief are \emph{candidates} for $\Mst$, not automatic entries.
-The threshold depends on the strength of the evidence, not on the diagnosis category: a fact that is self-evident from a single case (a metric that fails to compile, a condition that never fires) may be written after one occurrence, while anything inferred from outcomes (seed variance, effect sizes) requires the same anomaly on at least two chains.
-This rule keeps $\Mst$ from becoming a dumping ground, which matters because every active entry enters every prompt.
+Diagnoses are not copied into $\Mst$, since every evidence record of the chain, with its diagnosis, already enters the prompt.
+A revision may propose at most one entry, either a fact that is self-evident from a single case (a metric that fails to compile, a condition that never fires) or a lesson inferred from the outcomes of the chain (seed variance, effect sizes).
+No threshold applies beyond the reference check that every evidence record an entry cites belongs to the chain; whether a lesson is worth keeping is left to the Coach, which is asked to propose only lessons that belong to no single version.
+An entry that later evidence contradicts is superseded with \code{retract\_memory}.
 
 % ---------------------------------------------------------------------
 \subsection{Loop Control}
@@ -608,7 +614,8 @@ This rule keeps $\Mst$ from becoming a dumping ground, which matters because eve
 At the end of each round a chain takes one of three exits:
 \begin{itemize}[leftmargin=*,itemsep=2pt]
   \item \textbf{Next version} (default): $H^{(t+1)}$ is written to $\Hst$ and the chain returns to \cref{sec:hypothesis}.
-  \item \textbf{Converged}: $k_{\mathrm{conv}}$ consecutive rounds in which all three predictions are correct and no revision beyond \code{adjust\_confidence} is required.
+  \item \textbf{Converged}: the last $k_{\mathrm{conv}}$ rounds whose diagnosis is about the belief (rows 1--3 of \cref{tab:diagnosis}) all have three correct predictions, and no revision beyond \code{adjust\_confidence} is required.
+    Rounds with any other diagnosis did not test the belief, so correct predictions in them, such as a correct forecast that nothing moves, do not count.
     The output is a rule whose condition has been narrowed to its true range, which is then confirmed as described below.
     This is the main positive product of the system, not merely ``a hypothesis not yet refuted''.
   \item \textbf{Retired}: $k_{\mathrm{ret}}$ cumulative value disconfirmations (row 2 of \cref{tab:diagnosis}).
@@ -690,14 +697,15 @@ Without queueing, a round therefore takes about two hours of wall-clock time and
 Training accounts for about 80\% of the wall-clock time and the LLM for about 3\%, so the cost of the Coach is negligible next to the cost of its evidence.
 
 \paragraph{Scaling.}
-Chains interact only through the shared memory, so several chains can be advanced in parallel on separate GPUs at the same wall-clock cost per round.
+Chains do not interact, so several chains can be advanced in parallel on separate GPUs at the same wall-clock cost per round, in any order.
 The control runs are trained once and shared by all chains, adding only evaluations that are reused through the objective hash, and confirmation runs only for converged rules.
-Two further levers reduce the cost of screening: a screening tier that discards poor candidates with a fifth of the budget, and reduced scenarios for screening, which require custom player counts and initial states.
-At the cost of the pilot, about six GPU-hours per round, a budget of 150 GPU-hours buys about 25 rounds before these levers.
+At the cost of the pilot, about six GPU-hours per round, a budget of 150 GPU-hours buys about 25 rounds.
 
-Parallelism interacts with the shared memory.
-Chains advanced later inherit a larger memory and should converge faster, while chains advanced in parallel cannot see each other's results within a round.
-We therefore fix the execution order before the campaign, report each chain's index, and include it as a covariate in the analysis; once order is controlled for, a positive effect of chain index can be reported as evidence that the memory carries useful knowledge rather than as a confound.
+\paragraph{Possible extensions.}
+Two further levers could lower the cost of a round but are not part of the present design.
+A tiered budget would first screen each version with a fifth of the iterations and a single seed, looking only at the trend of execution and the early slope of benefit, and train only promising versions with the full budget and several seeds.
+Reduced scenarios, such as a 3v3 situation in the attacking third, would make screening cheaper still, but require the simulator to support custom player counts and initial states.
+We leave both to future work.
 
 % =====================================================================
 \section{Evaluation Protocol}
@@ -812,7 +820,6 @@ No chain & each round starts afresh from the last result only & Is this just ite
 Frozen hypothesis & no revision after round 1 & Is refinement across rounds necessary? & partial \\
 No deduction & evidence replay removed & What is deductive validation worth? & no \\
 Order shuffle & evidence order permuted, fold rerun & Is path dependence refinement or a random walk? & no \\
-Chain index & fixed order, index as covariate & Does memory, or tactic simplicity, speed later chains? & no \\
 Matched tokens & equal reasoning budget across conditions & Do gains come only from longer context? & no \\
 Placebo shaping & potential of the same magnitude with content unrelated to the hypothesis (e.g.\ a permuted gate) & Is it this tactic, or any shaping of this size? & yes \\
 \bottomrule
@@ -834,7 +841,7 @@ Commercial calls are pinned to dated model identifiers at temperature 0, and eve
 
 \subsection{Results}
 \todo{Pending.
-Planned: (i) prediction accuracy curves per chain for the twelve seeds; (ii) trajectories of trigger rate with effect sizes inside the condition; (iii) histograms of operator usage; (iv) replays with random feedback and without deduction; (v) growth of the shared memory over rounds; (vi) diagnosis distribution, in particular the share of diagnoses that are not about belief.}
+Planned: (i) prediction accuracy curves per chain for the twelve seeds; (ii) trajectories of trigger rate with effect sizes inside the condition; (iii) histograms of operator usage; (iv) replays with random feedback and without deduction; (v) growth of the memory of each chain over rounds; (vi) diagnosis distribution, in particular the share of diagnoses that are not about belief.}
 
 % =====================================================================
 \section{Discussion and Limitations}
