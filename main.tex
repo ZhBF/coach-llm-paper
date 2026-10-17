@@ -184,7 +184,7 @@ Since there is no tactic that can serve as ground truth, we measure progress by 
 
 \paragraph{Budget.}
 One round requires one adaptation run.
-A round costs about two hours of wall-clock time and six GPU-hours on our hardware (\cref{sec:efficiency}), so a campaign affords tens of rounds in total.
+In a pilot, a round cost about two hours of wall-clock time and six GPU-hours (\cref{sec:efficiency}), so a campaign affords tens of rounds in total.
 Every design decision below is made under this constraint.
 
 % =====================================================================
@@ -306,7 +306,9 @@ Because the gate is soft (\cref{sec:compile}), boundary scenarios can be defined
   \Xi^{-} = \{ s : g_C(s) \in [\tfrac12-\delta, \tfrac12) \},
 \end{equation}
 sampled from rollouts of the base policy.
-Starting episodes from chosen states is not supported by our simulator (\code{env\_spec}), so probing takes the form of post hoc stratification: evaluation rollouts from full matches are split by gate value into the two bands, with lower statistical power than probing from chosen initial states would have.
+Sampling a probe pair requires the simulator to start episodes from chosen states, which we add to MARLadona.
+Without it, probing would degrade to post hoc stratification, in which evaluation rollouts from full matches are split by gate value into the two bands, with lower statistical power.
+\todo{implement starting episodes from chosen states in the simulator.}
 
 \paragraph{Prediction commitment.}
 Before any GPU time is spent, the Coach commits a directional prediction $p_q \in \{\pUp, \pFlat, \pDown\}$ with a rationale for each of three quantities $q$:
@@ -424,10 +426,9 @@ Following \citet{wolczyk2024finetuning}, we regard adaptation as a problem of mi
   \mathcal{L}(\theta) = \mathcal{L}_{\mathrm{PPO}}(\theta)
   + \beta_{\mathrm{KS}}\, \E_{s\sim d^{\pi_\theta}}\!\bigl[\KL\bigl(\pi_0(\cdot\mid s)\,\|\,\pi_\theta(\cdot\mid s)\bigr)\bigr],
 \end{equation}
-which is kickstarting on on-policy states \citep{schmitt2018kickstarting}, with $\beta_{\mathrm{KS}} = 0.1$.
-We chose the weight with adaptations at $\lambda = 0$, that is, fine-tuning on the task reward alone, which should leave the policy near $\pi_0$ (measured with an earlier base policy).
-At $\beta_{\mathrm{KS}} = 0.01$ the change in match points of such runs had a standard deviation of about 0.15 across training seeds; at 0.1 it was about 0.02, and at 1.0 the policy stayed closer to $\pi_0$ without outcomes becoming more stable.
-Behavioral cloning replay on a fixed buffer of states visited by the base policy would address a different cause of forgetting, namely states the current policy no longer reaches; it remains an alternative that we have not needed.
+which is kickstarting on on-policy states \citep{schmitt2018kickstarting}.
+Its weight $\beta_{\mathrm{KS}}$ is chosen before the campaign with adaptations at $\lambda = 0$, that is, fine-tuning on the task reward alone, which should leave the policy near $\pi_0$, and then fixed.
+Behavioral cloning replay on a fixed buffer of states visited by the base policy would address a different cause of forgetting, namely states the current policy no longer reaches; it remains an alternative.
 
 \paragraph{Baseline execution first.}
 Before adaptation, $\pi_0$ is run against $\opp$ and its value on the $O^{\mathrm{exe}}$ metric, weighted by the gate as in \cref{sec:feedback}, is recorded as \code{baseline\_execution}.
@@ -445,7 +446,7 @@ Together they separate ``learned something, but not the intended thing'' from ``
 \paragraph{Execution rules.}
 \begin{itemize}[leftmargin=*,itemsep=2pt]
   \item \textbf{Shared starting point.} Every condition starts from the same $\pi_0$.
-    Much of the seed variance in MARL comes from early divergence, and a shared base policy removes that part, so three training seeds per round suffice.
+    Much of the seed variance in MARL comes from early divergence, and a shared base policy removes that part, so two or three training seeds per round suffice.
     The training seed, not the evaluation episode, is the unit of an adaptation's effect, and the tests of \cref{sec:feedback} resample at that level.
   \item \textbf{Fixed opponent pool, no self-play.} A coevolving opponent slows convergence and makes rounds incomparable, since more match points might only reflect a weaker opponent.
     Comparability across rounds is the premise of the refinement mechanism.
@@ -639,7 +640,7 @@ Training from scratch in every round would allow only a handful of rounds, too f
 Adapting a shared base policy avoids relearning locomotion, passing and positioning, and the shared starting point keeps the number of training seeds small.
 
 \paragraph{Measured cost of a round.}
-We measured the loop on one chain over three rounds, run unattended on a shared GPU cluster with one GPU per job.
+We measured the cost in a pilot of the loop: one chain over three rounds at a provisional adaptation budget, run unattended on a shared GPU cluster with one GPU per job.
 A round consists of three adaptation runs in parallel, one per training seed (2048 environments, 300 PPO iterations of about 19.5\,s each), one evaluation of each adapted policy, the attribution, and one Coach step (revision, validation, compilation and prediction).
 Training took 97--103\,min, evaluation 15--17\,min, attribution a few seconds, and the Coach step 3.4--3.8\,min including loading the model, of which about one minute was generation.
 Without queueing, a round therefore takes about two hours of wall-clock time and about 5.9 GPU-hours, spread over seven jobs (three for training, three for evaluation and one for the LLM).
@@ -647,8 +648,8 @@ Training accounts for about 80\% of the wall-clock time and the LLM for about 3\
 
 \paragraph{Scaling.}
 Chains interact only through the shared memory, so several chains can be advanced in parallel on separate GPUs at the same wall-clock cost per round.
-Two further levers are planned but not yet implemented: a screening tier that discards poor candidates with a fifth of the budget, and reduced scenarios for screening, which would require custom player counts or initial states.
-At about six GPU-hours per round, a budget of 150 GPU-hours buys about 25 rounds.
+Two further levers reduce the cost of screening: a screening tier that discards poor candidates with a fifth of the budget, and reduced scenarios for screening, which require custom player counts and initial states.
+At the cost of the pilot, about six GPU-hours per round, a budget of 150 GPU-hours buys about 25 rounds before these levers.
 
 Parallelism interacts with the shared memory.
 Chains advanced later inherit a larger memory and should converge faster, while chains advanced in parallel cannot see each other's results within a round.
@@ -665,8 +666,8 @@ The pitch is 10.34\,m by 6.89\,m with goals 1.84\,m wide, and it is enclosed by 
 There is no offside rule, no penalty area and no dedicated goalkeeper: all players of a team share one policy, and any of them may stand in goal.
 Each episode starts from a randomized kickoff formation, with both teams in their own half and the ball near the center, and ends at the first goal.
 Each player commands a target body velocity and, while the ball is just in front of it, a ball velocity for dribbling or kicking.
-The base policy $\pi_0$ is trained by self-play for 10{,}000 PPO iterations against a pool of up to four earlier snapshots of itself, then frozen.
-\code{env\_spec} records these rules, the action and observation spaces, and what the environment allows to be configured; in particular, it states that episodes cannot be started from chosen states.
+A base policy $\pi_0$ is trained by self-play until competent, then frozen.
+\code{env\_spec} records these rules, the action and observation spaces, and what the environment allows to be configured.
 The metric registry contains 10--15 metrics with frozen percentile statistics under $\pi_0$.
 
 The first batch consists of twelve seed hypotheses drawn from common soccer principles (\cref{tab:seeds}).
@@ -711,11 +712,10 @@ The pool composition will be reported with every converged hypothesis.
 
 The following settings are fixed before a campaign and stored with it, together with hashes of the frozen base policy, opponent pool and metric registry.
 \begin{itemize}[leftmargin=*,itemsep=2pt]
-  \item \textbf{Adaptation.} Three training seeds per round, fresh in every round; 300 PPO iterations from $\pi_0$ with 2048 parallel environments, full teams on the full pitch; training episodes of up to 120\,s; $\beta_{\mathrm{KS}} = 0.1$.
-    The shaping ratio $\rho$ is still open (\cref{sec:compile}).
-  \item \textbf{Evaluation.} Each adapted policy and $\pi_0$ play 2048 episodes against $\opp$, both teams taking the mean of their action distributions; episodes run for up to 300\,s, and benefit is scored at that cutoff.
-  \item \textbf{Diagnosis.} $\epsilon_g = 0.02$ and $\epsilon_{\mathrm{KL}} = 0.03$; 95\% bootstrap intervals with 2000 resamples.
-  \item \textbf{Loop control.} $k_{\mathrm{conv}} = k_{\mathrm{ret}} = 2$; at most $n_{\mathrm{att}} = 3$ attempts per Coach step; a budget of $B$ training rounds per campaign.
+  \item \textbf{Adaptation.} The number of training seeds per round, drawn fresh in every round (\cref{sec:compile}); the number of PPO iterations from $\pi_0$; training episodes of up to 120\,s; the weight $\beta_{\mathrm{KS}}$ (\cref{sec:adapt}); and the shaping ratio $\rho$, which is still open (\cref{sec:compile}).
+  \item \textbf{Evaluation.} The number of episodes that each adapted policy and $\pi_0$ play against $\opp$, both teams taking the mean of their action distributions; episodes run for up to 300\,s, and benefit is scored at that cutoff.
+  \item \textbf{Diagnosis.} The thresholds $\epsilon_g$ and $\epsilon_{\mathrm{KL}}$; 95\% bootstrap intervals.
+  \item \textbf{Loop control.} $k_{\mathrm{conv}}$ and $k_{\mathrm{ret}}$; at most $n_{\mathrm{att}} = 3$ attempts per Coach step; a budget of $B$ training rounds per campaign.
   \item \textbf{Coach.} Temperature 0, thinking mode off, prefix caching off, constrained decoding against the schema of each call.
 \end{itemize}
 
