@@ -383,14 +383,22 @@ The shaping reward follows PBRS \citep{ng1999policy},
   F(s,s') = \lambda\,\bigl(\gamma\,\Phi(s') - \Phi(s)\bigr), \qquad \tilde r = r + F,
   \label{eq:pbrs}
 \end{equation}
-with $\Phi(s_{\mathrm{terminal}}) = 0$.
+and three rules at the boundaries of an episode.
+When an episode ends in a goal, the next state is terminal and $\Phi(s') = 0$.
+When an episode reaches its time limit, it is truncated rather than ended: PPO bootstraps the value of the last state, so $\Phi(s')$ keeps its actual value, as in a task that continues.
+The first step of an episode carries no shaping term, so shaping starts from the second state $s_1$ and keeps the potential-based form over the remaining steps.
+
 The global magnitude $\lambda$ is not part of the hypothesis.
 A badly chosen $\lambda$ can manufacture three different diagnoses (if it is too large, the policy follows the tactic while losing; if it is too small, execution never moves), so we normalize it against the magnitude of task return measured on rollouts of the base policy at a fixed ratio $\rho$ shared by all hypotheses, $\lambda = \rho\,\bar R_0$.
+Here $\bar R_0$ is the absolute value of the undiscounted task return per player of our team (the return of the team divided by its number of players), averaged over episodes.
+It is measured on rollouts that match training: our team plays $\pi_0$, sampling from its action distribution as during adaptation, against the frozen opponent pool, with the training episode length and the training weight of every reward term.
+Since $\Phi \in [0,1]$, $\lambda$ also bounds the shaping that one episode can add for a player, so $\rho$ reads as the size of the shaping relative to the typical task return.
 \todo{fix $\rho$ from the study of the base policy.}
 
 \paragraph{Interpretation under PBRS.}
 Every metric in $\Phi$ is computed by the simulator from the global state $s$, although no single agent observes all of its inputs.
-When $\Phi$ is a function of $s$, the shaping terms of \cref{eq:pbrs} telescope along every trajectory to $-\lambda\,\Phi(s_0)$, which does not depend on the policy; the ranking of joint policies, and hence the set of optimal ones, is therefore unchanged \citep{ng1999policy}, also when policies condition only on local observations.
+When $\Phi$ is a function of $s$, the shaping terms of \cref{eq:pbrs} telescope along every episode that ends in a goal to $-\gamma\lambda\,\Phi(s_1)$, because shaping starts at $s_1$ and the terminal potential is zero; in a truncated episode, the potential at the time limit is carried forward by the bootstrapped value.
+$\Phi(s_1)$ depends on the policy only through its first action, an effect that is negligible over episodes of hundreds of steps; up to this effect, the ranking of joint policies, and hence the set of optimal ones, is unchanged \citep{ng1999policy}, also when policies condition only on local observations.
 The effect of a tactic is therefore an \emph{inductive bias under a finite adaptation budget}: it changes which solution an adaptation of $\pi_0$ with a limited budget reaches, not what is optimal in the limit.
 We accordingly measure benefit at a fixed adaptation budget and read a hypothesis as a claim about that regime.
 Three caveats follow.
