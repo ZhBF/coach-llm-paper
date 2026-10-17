@@ -148,7 +148,8 @@ Our shaping follows potential-based reward shaping (PBRS) \citep{ng1999policy}.
 We consider a partially observable Markov game between two teams with global state $s\in\mathcal{S}$, joint action $\mathbf{a}$, transition kernel $P$, task reward $r$ and discount $\gamma$.
 Each agent $i$ receives only a local observation $o_i = \Omega_i(s)$; in MARLadona this comprises the agent's own pose and velocity, the ball, the field geometry and the poses of teammates and opponents, encoded by a network that does not depend on their order \citep{li2025marladona}.
 In our 11v11 setting every agent observes all ten teammates and all eleven opponents.
-Our team is controlled by a parameterized policy $\pi_\theta$; the opposing team is drawn from a \emph{fixed} opponent pool $\opp$.
+Our team is controlled by a parameterized policy $\pi_\theta$; the opposing team is drawn from a \emph{fixed} opponent pool $\opp$ of policies with distinct behavioral traits, frozen for the whole campaign.
+A separate set $\opp'$ of held-out opponents is used only to confirm converged rules.
 A base policy $\pi_0$ that already plays competently is trained once and frozen.
 
 \paragraph{Tactical hypotheses.}
@@ -180,6 +181,8 @@ When it is spent, chains that are still open stop without a terminal state and a
 \paragraph{What is being optimized.}
 The goal is not to maximize task return.
 It is to obtain, for each seed, either a rule whose condition $C$ has been narrowed to the range in which the stated mechanism and benefit actually hold in this environment, or a verdict, well supported by the evidence, that the hypothesis is wrong.
+Both are statements relative to $\opp$: a rule claims that, against these opponents, training toward the tactic yields more benefit than the same amount of training without it, through the stated mechanism.
+Converged rules are additionally confirmed against held-out opponents and against opponents that adapt to them within a limited budget (\cref{sec:confirm}); robustness to opponents that adapt without limit is outside the scope of the claim.
 Since there is no tactic that can serve as ground truth, we measure progress by the accuracy of the Coach's preregistered predictions along each chain (\cref{sec:metrics}).
 
 \paragraph{Budget.}
@@ -247,11 +250,11 @@ Three append-only stores carry all state across rounds.
 
 Two artifacts are fixed for an entire campaign.
 The \emph{environment specification} \code{env\_spec} declares what the environment supports (offside, goalkeeper, out-of-bounds, penalty area, players per side, \dots); it is a property of the environment and is stated once rather than per hypothesis.
-The \emph{metric registry} $\reg$ is the compiler's vocabulary: each metric $m$ that can be computed, the \code{env\_spec} capability it depends on, and its empirical distribution under rollouts of the base policy.
+The \emph{metric registry} $\reg$ is the compiler's vocabulary: each metric $m$ that can be computed, the \code{env\_spec} capability it depends on, and its empirical distribution under rollouts of the base policy against the opponent pool.
 Metrics are written in advance; the LLM selects and parameterizes them but never writes code for a new one.
 
 \paragraph{Reproducibility by replay.}
-Both artifacts, including the rollout statistics measured once against $\pi_0$ before the campaign, are versioned and frozen.
+Both artifacts, including the rollout statistics measured once against $\pi_0$ before the campaign, are versioned and frozen, and so are the opponent pool $\opp$, the held-out set $\opp'$ and the control runs of \cref{sec:adapt}.
 Consequently, the \emph{input} of every Coach call is fully determined by the seeds of round 0, the ordered store logs and the Coach configuration.
 This is testable: replaying the pipeline must yield prompts identical byte for byte.
 The Coach is decoded at temperature 0, so its outputs, and with them the violation feedback of rejected revisions (\cref{sec:revision}), are also repeatable, up to nondeterminism in the inference backend.
@@ -288,9 +291,9 @@ $M$ & Coach & mechanism explaining why the tactic should work, in coach language
 \code{derived\_by} & Coach & operators, induction rule and call that produced this version; null for a seed \\
 \code{objective} & \cref{sec:compile} & compiled specification $\omega$ and its hash \\
 \code{prediction} & Coach, before training & raw direction (\pUp/\pFlat/\pDown) of three quantities, with confidence and rationale; frozen once written \\
-\code{screening} & \cref{sec:adapt} & \code{baseline\_execution} measured on $\pi_0$, and its source \\
+\code{screening} & \cref{sec:adapt} & \code{baseline\_execution} measured on $\pi_0$ for reference, and its source \\
 \code{evidence\_ref} & \cref{sec:feedback} & the evidence record of this version \\
-\code{terminal} & \cref{sec:control}, chain tail only & \textsc{converged} or \textsc{retired} \\
+\code{terminal} & \cref{sec:control}, chain tail only & \textsc{converged} or \textsc{retired}; for a converged rule, also the outcome of its confirmation \\
 \code{note} & Coach, optional & a semantic caveat the compiler cannot detect \\
 \bottomrule
 \end{tabularx}
@@ -353,9 +356,11 @@ The entire output space of the compiler is the following grammar, which compiles
 \end{align}
 All thresholds $\theta, \ell_i, h_i$ and widths $w$ are expressed as \emph{percentiles} of the registry's statistics under the base policy, never as absolute numbers.
 Disjunction is not offered as a first-class operator: narrowing adds a conjunct or tightens a percentile, and widening does the reverse.
+Conditions are built only from metrics of the state, and no metric identifies an opponent, so a condition cannot name a member of the pool; such a condition would encode that opponent's fingerprint rather than a range of applicability.
 
 \paragraph{Soft gate.}
-Let $F_m$ be the frozen empirical CDF of metric $m$ under $\pi_0$, and $q_m(s) = 100\,F_m\bigl(m(s)\bigr)$ its percentile rank.
+Let $F_m$ be the frozen empirical CDF of metric $m$ under rollouts of $\pi_0$ against $\opp$, with opponents mixed in the same proportions as in training and evaluation, and $q_m(s) = 100\,F_m\bigl(m(s)\bigr)$ its percentile rank.
+Calibrating against the pool rather than against $\pi_0$ alone keeps the meaning of a percentile the same as in the matches that the gate is applied to.
 A gate is a sigmoid centered at $\theta$ whose 10--90\% transition spans $w$ percentile points,
 \begin{equation}
   \sigma(m, \theta, w)(s) = \frac{1}{1+\exp\!\bigl(-\kappa\,(q_m(s)-\theta)/w\bigr)}, \qquad \kappa = 2\ln 9,
@@ -418,13 +423,13 @@ The canonical serialization of $\omega$ (canonical JSON with fixed numeric preci
 A version whose objective hash equals that of an earlier version, typically after a revision that only adjusts confidence, is not served from a cache.
 It is trained again on fresh training seeds, and its evidence record lists the earlier records with the same objective in \code{replicate\_of}.
 Reusing the earlier record would count the same data twice, and two identical records with correct predictions would satisfy the convergence criterion of \cref{sec:control} without any new evidence.
-The hash is still used to reuse \code{baseline\_execution}, which depends only on $\pi_0$ and the objective.
+The hash is still used to reuse evaluations that depend only on the objective: those of $\pi_0$ and of the control runs (\cref{sec:adapt}).
 
 % ---------------------------------------------------------------------
 \subsection{Policy Adaptation and Evaluation}
 \label{sec:adapt}
 
-This step adapts the base policy $\pi_0$ to the objective $\omega$ against the fixed opponent pool $\opp$.
+This step adapts the base policy $\pi_0$ to the objective $\omega$ against the fixed opponent pool $\opp$, and evaluates the result together with the control runs that serve as its reference.
 Besides the adapted policy $\pi_\theta$, its training curves and its evaluation metrics, it records \code{baseline\_execution}, the mean gate value and the KL divergence from the base policy.
 
 The step fine-tunes $\pi_0$ on $\tilde r$ with the PPO setup of MARLadona \citep{schulman2017ppo,li2025marladona}: a single policy shared by all players of our team, a critic that receives the same local observation as the actor (and is therefore not the centralized critic of MAPPO \citep{yu2022mappo}), data augmentation by mirroring states and actions from left to right, and a learning rate adapted to a target KL divergence between updates.
@@ -438,9 +443,15 @@ which is kickstarting on on-policy states \citep{schmitt2018kickstarting}.
 Its weight $\beta_{\mathrm{KS}}$ is chosen before the campaign with adaptations at $\lambda = 0$, that is, fine-tuning on the task reward alone, which should leave the policy near $\pi_0$, and then fixed.
 Behavioral cloning replay on a fixed buffer of states visited by the base policy would address a different cause of forgetting, namely states the current policy no longer reaches; it remains an alternative.
 
-\paragraph{Baseline execution first.}
-Before adaptation, $\pi_0$ is run against $\opp$ and its value on the $O^{\mathrm{exe}}$ metric, weighted by the gate as in \cref{sec:feedback}, is recorded as \code{baseline\_execution}.
-Execution is always reported as a delta from this value; otherwise any tendency the base policy already has would count as the tactic's effect, and hypotheses aligned with that tendency would pass for free.
+\paragraph{Control adaptation.}
+The reference for every effect is a control: adaptations of $\pi_0$ at $\lambda = 0$, with the same opponent pool, retention term, budget and evaluation as the shaped runs, so that the two differ only in the shaping.
+A tactic is a claim about an inductive bias under a finite adaptation budget (\cref{sec:compile}), and its counterfactual is the same adaptation without that bias, just as a coach's instruction is judged against the same hours of practice without it.
+Comparing with $\pi_0$ instead would credit the tactic with whatever the adaptation does on its own, including drift, learning to exploit the fixed opponents, and any tendency the base policy already has; against the control these effects appear in both arms and cancel.
+In the limit of an unbounded budget, PBRS predicts no difference in benefit from the control, which is consistent with the reading of a tactic as an inductive bias; a difference from $\pi_0$ would instead tend to the gain from further training, which has nothing to do with the tactic.
+The control does not depend on any hypothesis, so a single set of control runs, trained once before the campaign with more seeds than a round uses, serves every chain and round.
+Because all rounds share it, their deltas are correlated through its estimate; its larger number of seeds keeps that correlation small, and its uncertainty enters every interval (\cref{sec:feedback}).
+The execution and mediator metrics are weighted by the gate of each objective, so the control policies are evaluated once per objective, and the result is reused through the objective hash.
+\code{baseline\_execution}, the execution of $\pi_0$ itself weighted by the gate as in \cref{sec:feedback}, is still recorded for reference but enters no delta.
 
 \paragraph{Diagnostics.}
 Two quantities are logged for every run:
@@ -448,7 +459,7 @@ Two quantities are logged for every run:
   \gbar = \E_{s\sim d^{\pi_\theta}}\bigl[g_C(s)\bigr], \qquad
   \mathrm{KL}_0 = \E_{s\sim d^{\pi_\theta}}\bigl[\KL\bigl(\pi_\theta(\cdot\mid s)\,\|\,\pi_0(\cdot\mid s)\bigr)\bigr].
 \end{equation}
-$\gbar$ indicates whether the shaping signal was generated at all; $\mathrm{KL}_0$ indicates whether the policy moved.
+$\gbar$ indicates whether the shaping signal was generated at all; $\mathrm{KL}_0$, compared with its value in the control runs, indicates whether the shaping moved the policy further than fine-tuning alone does.
 Together they separate ``learned something, but not the intended thing'' from ``did not move'' (\cref{sec:feedback}).
 
 \paragraph{Execution rules.}
@@ -456,8 +467,11 @@ Together they separate ``learned something, but not the intended thing'' from ``
   \item \textbf{Shared starting point.} Every condition starts from the same $\pi_0$.
     Much of the seed variance in MARL comes from early divergence, and a shared base policy removes that part, so two or three training seeds per round suffice.
     The training seed, not the evaluation episode, is the unit of an adaptation's effect, and the tests of \cref{sec:feedback} resample at that level.
-  \item \textbf{Fixed opponent pool, no self-play.} A coevolving opponent slows convergence and makes rounds incomparable, since more match points might only reflect a weaker opponent.
-    Comparability across rounds is the premise of the refinement mechanism.
+  \item \textbf{Fixed opponent pool, no self-play.} Opponents are drawn from $\opp$ in fixed proportions shared by all hypotheses and rounds, and during training they sample from their action distributions, since a deterministic opponent is the easiest to exploit.
+    Nothing in the pool learns during adaptation.
+    A coevolving opponent would make rounds incomparable, since more match points might only reflect a weaker opponent.
+    It would also shift the distribution of opponent states on which conditions and the calibration of the gates rest: an opponent that shares the shaping executes the tactic too, so a condition such as ``the opponent is compact'' would fire less and less often as training proceeds.
+    Comparability across rounds is the premise of the refinement mechanism; robustness to adapting opponents is tested separately, on converged rules only (\cref{sec:confirm}).
   \item \textbf{Tiered budget.} A screening tier uses one fifth of the step budget and one seed, looking only at the execution trend and the early slope of benefit; a confirmation tier uses the full budget and multiple seeds.
   \item \textbf{Reduced scenarios} for screening (e.g.\ a 3v3 situation in the attacking third), with full matches reserved for confirmation, contingent on simulator support.
 \end{itemize}
@@ -468,11 +482,11 @@ Together they separate ``learned something, but not the intended thing'' from ``
 
 This step turns the raw output of \cref{sec:adapt} into one \code{EvidenceRecord}, which is written to $\Est$.
 
-Three quantities are computed, all relative to the base policy evaluated in the same setup:
+Three quantities are computed, all relative to the control policies $\pi_{\mathrm{ctrl}}$ of \cref{sec:adapt}, evaluated in the same setup:
 \begin{align}
-  \Delta_{\mathrm{exe}} &= \bar o^{\mathrm{exe}}(\pi_\theta) - \texttt{baseline\_execution}, \\
-  \Delta_{\mathrm{med}} &= \bar o^{\mathrm{med}}(\pi_\theta) - \bar o^{\mathrm{med}}(\pi_0), \\
-  \Delta_{\mathrm{ben}} &= \mathrm{Pts}(\pi_\theta) - \mathrm{Pts}(\pi_0).
+  \Delta_{\mathrm{exe}} &= \bar o^{\mathrm{exe}}(\pi_\theta) - \bar o^{\mathrm{exe}}(\pi_{\mathrm{ctrl}}), \\
+  \Delta_{\mathrm{med}} &= \bar o^{\mathrm{med}}(\pi_\theta) - \bar o^{\mathrm{med}}(\pi_{\mathrm{ctrl}}), \\
+  \Delta_{\mathrm{ben}} &= \mathrm{Pts}(\pi_\theta) - \mathrm{Pts}(\pi_{\mathrm{ctrl}}).
 \end{align}
 Here $\bar o^{\mathrm{exe}}$ is the mean over evaluation episodes of the gate-weighted mean of the execution metric $m$ within an episode, $\sum_s g_C(s)\,m(s) / \sum_s g_C(s)$; episodes in which the gate never opens are skipped.
 Weighting by the gate measures the tactic where it is supposed to apply.
@@ -482,11 +496,15 @@ $\mathrm{Pts}$ is the mean match points against $\opp$, with 1 for a win, 0.5 fo
 An episode ends at the first goal, so a win means scoring first within the cutoff.
 Points are a single task-level definition shared by all hypotheses, so that benefit is comparable across them; unlike win rate, they do not count a scoreless draw as a loss.
 
-Each delta is mapped to an observed direction $o_q \in \{\pUp,\pFlat,\pDown\}$ by a percentile bootstrap at two levels: training seeds are resampled first, then evaluation episodes within each drawn seed, while $\pi_0$, a single fixed policy, has only its episodes resampled.
+Each delta is mapped to an observed direction $o_q \in \{\pUp,\pFlat,\pDown\}$ by a percentile bootstrap at two levels, applied to both arms: training seeds are resampled first, then evaluation episodes within each drawn seed.
 The direction is \pUp\ or \pDown\ when the 95\% interval excludes zero, and \pFlat\ otherwise.
 Resampling seeds matters because the effect of an adaptation varies far more between training seeds than between episodes, and an interval from episodes alone is too narrow.
 The comparison is not paired, since the kickoff of every evaluation episode is drawn afresh.
 Like the predictions, $o_q$ is a raw direction; for the diagnosis it is converted to the direction relative to the hypothesis, which reverses it for a metric that $O$ claims should decrease.
+
+Besides the deltas over the whole pool, each quantity is reported separately for each opponent of $\opp$.
+These results enter the evidence record and the prompt of the Coach, but not the diagnosis, which uses the pooled deltas.
+A tactic that works only against an opponent with a particular trait is evidence for narrowing $C$ to the states that this trait produces.
 
 \paragraph{Diagnosis.}
 The diagnosis is assigned programmatically by the ordered rules of \cref{tab:diagnosis}.
@@ -509,13 +527,14 @@ Execution therefore gates everything: if our side did not do what the tactic ask
 3 & \pUp & $\neg\pUp$ & any & \code{belief\_disconfirmed\_mechanism} & chain; prefer \code{revise\_mechanism} \\
 \midrule
 4 & $\neg\pUp$ & -- & -- & \code{condition\_too\_rare} \ ($\gbar < \epsilon_g$) & shared memory; widen $C$ \\
-5 & $\neg\pUp$ & -- & -- & \code{insufficient\_adaptation} \ ($\mathrm{KL}_0 < \epsilon_{\mathrm{KL}}$) & shared memory; fix adaptation \\
+5 & $\neg\pUp$ & -- & -- & \begin{tabular}[t]{@{}l@{}}\code{insufficient\_adaptation}\\ ($\mathrm{KL}_0 < \mathrm{KL}_0^{\mathrm{ctrl}} + \epsilon_{\mathrm{KL}}$)\end{tabular} & shared memory; fix adaptation \\
 6 & $\neg\pUp$ & -- & -- & \code{translation\_failure} \ (otherwise) & shared memory; fix compilation \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-The three rows with flat execution are distinguished by \emph{cause}, not by outcome, because each calls for a different repair: a gate that never opened needs a wider condition, a policy that never moved needs different adaptation hyperparameters, and a policy that moved in the wrong direction needs a different compilation.
+The three rows with flat execution are distinguished by \emph{cause}, not by outcome, because each calls for a different repair: a gate that never opened needs a wider condition, a policy that the shaping did not move needs different adaptation hyperparameters, and a policy that moved in the wrong direction needs a different compilation.
+Fine-tuning alone already moves the policy away from $\pi_0$, so row 5 compares $\mathrm{KL}_0$ with its mean $\mathrm{KL}_0^{\mathrm{ctrl}}$ over the control runs rather than with zero, and $\epsilon_{\mathrm{KL}}$ is a margin above it.
 Collapsing them would let engineering noise masquerade as belief evidence.
 Row 3 captures a distinct and informative case: our team executed the tactic, but the opponent did not respond as $M$ claims.
 Even if benefit rose, the stated reason is wrong.
@@ -590,7 +609,7 @@ At the end of each round a chain takes one of three exits:
 \begin{itemize}[leftmargin=*,itemsep=2pt]
   \item \textbf{Next version} (default): $H^{(t+1)}$ is written to $\Hst$ and the chain returns to \cref{sec:hypothesis}.
   \item \textbf{Converged}: $k_{\mathrm{conv}}$ consecutive rounds in which all three predictions are correct and no revision beyond \code{adjust\_confidence} is required.
-    The output is a rule whose condition has been narrowed to its true range.
+    The output is a rule whose condition has been narrowed to its true range, which is then confirmed as described below.
     This is the main positive product of the system, not merely ``a hypothesis not yet refuted''.
   \item \textbf{Retired}: $k_{\mathrm{ret}}$ cumulative value disconfirmations (row 2 of \cref{tab:diagnosis}).
     The output is a hypothesis the evidence has judged wrong.
@@ -602,6 +621,20 @@ With budgets of tens of rounds, this is likely to be a common outcome.
 $k_{\mathrm{conv}}$, $k_{\mathrm{ret}}$ and $B$ are fixed in the configuration before experiments begin (\cref{sec:config}) and are not adjusted afterwards.
 Because seed hypotheses are drawn from soccer practice, we expect refinement to be the common outcome and retirement the rare one; a campaign in which \code{retire} never fires is therefore not evidence of failure, provided \code{narrow\_condition} produces substantive narrowing.
 
+\paragraph{Confirmation of converged rules.}
+\label{sec:confirm}
+A converged rule has been refined against the opponents of $\opp$, and the refinement may have fitted it to them.
+Before it is reported, two checks are run on the converged version and on the control, with settings fixed before the campaign.
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Held-out opponents.} Both are evaluated, without further training, against the set $\opp'$ of opponents that never take part in training, for example self-play checkpoints with different behavior or trait variants absent from $\opp$.
+    The rule passes if benefit and mediator move in the same directions as on $\opp$.
+  \item \textbf{Adaptive opponents.} With our side frozen, opponents from $\opp$ are trained without shaping, for a fixed and limited budget, once against the converged policy and once against the control policy.
+    The rule passes if the difference in benefit between the two remains after both opponents have adapted, and the result is reported as kept, weakened or reversed.
+    The comparison with the control matters, because adapting opponents lower the points of any frozen policy.
+\end{itemize}
+The results are written as evidence records marked as confirmation, but they are never shown to the Coach and never drive a revision; otherwise $\opp'$ would stop being held out.
+A rule that fails is not reopened: its terminal state records the outcome, as converged and confirmed, converged but not confirmed on held-out opponents, or converged but not confirmed against adaptive opponents.
+
 The complete procedure for one chain is summarized in \cref{alg:loop}.
 A version that fails to compile is revised in place before any prediction is committed, so the round counter advances only after a training run and every $H^{(t)}$ with $t \ge 1$ has exactly one evidence record $e^{(t)}$ behind it.
 Both terminal checks depend on the operators returned by the Coach: convergence requires that they contain nothing beyond \code{adjust\_confidence}, and the confidence update is kept as the final version of the chain.
@@ -612,7 +645,8 @@ When the chain is retired, the candidate $H'$ is not used.
 \label{alg:loop}
 \small
 \KwData{stores $\Hst,\Est,\Mst$; \code{env\_spec}; metric registry $\reg$;\\
-  base policy $\pi_0$; opponent pool $\opp$; training seeds $Z$}
+  base policy $\pi_0$; opponent pool $\opp$; held-out opponents $\opp'$;\\
+  control policies $\pi_{\mathrm{ctrl}}$; training seeds $Z$}
 \KwIn{seed hypothesis $H^{(0)}$; thresholds $k_{\mathrm{conv}}, k_{\mathrm{ret}}$; round budget $B$; attempts $n_{\mathrm{att}}$}
 \KwOut{chain $H^{(0:t)}$ whose tail is marked \textsc{converged} or \textsc{retired}, or left open when the budget is spent}
 $t \leftarrow 0$\;
@@ -623,9 +657,9 @@ $t \leftarrow 0$\;
   }
   $\omega \leftarrow \textsc{Compile}(H^{(t)}.C, H^{(t)}.O^{\mathrm{exe}}, \code{env\_spec}, \reg)$\;
   $H^{(t)}.\text{prediction} \leftarrow \textsc{CommitPrediction}(H^{(0:t)}, e^{(1:t)}, \Mst)$; append $H^{(t)}$ to $\Hst$\;
-  $b \leftarrow \textsc{BaselineExecution}(\pi_0, \omega, \opp)$\;
+  $c \leftarrow \textsc{Evaluate}(\pi_{\mathrm{ctrl}}, \omega, \opp)$, reused by objective hash\;
   $(\pi_\theta, \gbar, \mathrm{KL}_0, \text{metrics}) \leftarrow \textsc{Adapt}(\pi_0, \Phi_\omega, \opp, Z)$\;
-  $e^{(t+1)} \leftarrow \textsc{Attribute}(\text{metrics}, b, \gbar, \mathrm{KL}_0)$; append $e^{(t+1)}$ to $\Est$\;
+  $e^{(t+1)} \leftarrow \textsc{Attribute}(\text{metrics}, c, \gbar, \mathrm{KL}_0)$; append $e^{(t+1)}$ to $\Est$\;
   $\nu \leftarrow \varnothing$; $a \leftarrow 0$\;
   \Repeat{$\nu = \varnothing$ \textbf{or} $a = n_{\mathrm{att}}$}{
     $(\text{ops}, \mu^{(t+1)}) \leftarrow \Gamma(H^{(0:t)}, e^{(1:t+1)}, \Mst, \nu)$\;
@@ -634,7 +668,8 @@ $t \leftarrow 0$\;
   }
   \lIf{$\nu \neq \varnothing$}{\textbf{fail}: stop, writing nothing but the archived calls}
   \lIf{$\mu^{(t+1)} \neq \varnothing$}{append $\mu^{(t+1)}$ to $\Mst$}
-  \uIf{converged under $k_{\mathrm{conv}}$ given ops}{$H^{(t+1)} \leftarrow H'$; $t \leftarrow t+1$; mark $H^{(t)}$ \textsc{converged}; append $H^{(t)}$ to $\Hst$\;}
+  \uIf{converged under $k_{\mathrm{conv}}$ given ops}{$H^{(t+1)} \leftarrow H'$; $t \leftarrow t+1$; mark $H^{(t)}$ \textsc{converged}; append $H^{(t)}$ to $\Hst$\;
+    record $\textsc{Confirm}(H^{(t)}, \pi_{\mathrm{ctrl}}, \opp', \opp)$ with the terminal state, hidden from $\Gamma$\;}
   \uElseIf{retired under $k_{\mathrm{ret}}$ \textbf{or} \code{retire} $\in$ ops}{mark $H^{(t)}$ \textsc{retired}\;}
   \lElse{$H^{(t+1)} \leftarrow H'$; $t \leftarrow t+1$}
 }
@@ -656,6 +691,7 @@ Training accounts for about 80\% of the wall-clock time and the LLM for about 3\
 
 \paragraph{Scaling.}
 Chains interact only through the shared memory, so several chains can be advanced in parallel on separate GPUs at the same wall-clock cost per round.
+The control runs are trained once and shared by all chains, adding only evaluations that are reused through the objective hash, and confirmation runs only for converged rules.
 Two further levers reduce the cost of screening: a screening tier that discards poor candidates with a fifth of the budget, and reduced scenarios for screening, which require custom player counts and initial states.
 At the cost of the pilot, about six GPU-hours per round, a budget of 150 GPU-hours buys about 25 rounds before these levers.
 
@@ -707,12 +743,15 @@ H-012 & ball won but opponent counter-presses & exit pressure zone / find player
 \raggedright\scriptsize $^{\dagger}$Without an offside rule this degenerates into goal-hanging. $^{\ddagger}$The mediator is nearly mechanical; the substantive claim is at the benefit level.
 \end{table}
 
-\paragraph{Opponent pool (open).}
-A frozen copy of $\pi_0$ satisfies the requirement of a fixed pool, but a single opponent makes a third of the seeds untestable and leaves converged conditions open to the objection that they encode one opponent's fingerprint rather than the tactic's boundary.
+\paragraph{Opponent pool.}
+A frozen copy of $\pi_0$ alone would satisfy the requirement of a fixed pool, but a single opponent makes a third of the seeds untestable and leaves converged conditions open to the objection that they encode one opponent's fingerprint rather than the tactic's boundary.
 Training checkpoints are a cheap but poor source of diversity, since early and late checkpoints differ in strength rather than behavioral trait.
-We instead plan to build trait variants with the same compiler used for hypotheses (e.g.\ training an opponent under a ``hold a high defensive line'' potential), so that traits are defined rather than labeled after the fact and pool coverage can be checked programmatically.
-A minimal pool is $\pi_0$ plus three compiled variants (high line, counter-press, short build-up).
-Open questions include the number of variants, whether traits acquired in training fire conditions often enough to learn from, and whether opponents are sampled uniformly or matched to each hypothesis.
+We therefore build trait variants with the same compiler used for hypotheses: an opponent is adapted from $\pi_0$ under a potential that rewards the trait (e.g.\ ``hold a high defensive line''), so that traits are defined rather than labeled after the fact.
+A variant enters the pool only after two programmatic checks: its trait metric must have moved significantly from that of $\pi_0$, and its match points against $\pi_0$ must lie within a band fixed in advance, so that a gain in benefit cannot simply reflect a weaker opponent.
+The pool is $\pi_0$ plus three compiled variants (high line, counter-press, short build-up).
+Opponents are mixed in fixed proportions shared by all hypotheses, rather than matched to each, so that benefit stays comparable across hypotheses; the per-opponent results of \cref{sec:feedback} show where a tactic works.
+The held-out set $\opp'$ is frozen at the same time and never used in training.
+Open questions are the number of variants and whether traits acquired in training fire conditions often enough to learn from.
 The pool composition will be reported with every converged hypothesis.
 
 \subsection{Configuration}
@@ -720,8 +759,9 @@ The pool composition will be reported with every converged hypothesis.
 
 The following settings are fixed before a campaign and stored with it, together with hashes of the frozen base policy, opponent pool and metric registry.
 \begin{itemize}[leftmargin=*,itemsep=2pt]
-  \item \textbf{Adaptation.} The number of training seeds per round, drawn fresh in every round (\cref{sec:compile}); the number of PPO iterations from $\pi_0$; training episodes of up to 120\,s; the weight $\beta_{\mathrm{KS}}$ (\cref{sec:adapt}); and the shaping ratio $\rho$, which is still open (\cref{sec:compile}).
-  \item \textbf{Evaluation.} The number of episodes that each adapted policy and $\pi_0$ play against $\opp$, both teams taking the mean of their action distributions; episodes run for up to 300\,s, and benefit is scored at that cutoff.
+  \item \textbf{Opponents.} The members of $\opp$ and their mixing proportions, the strength band for trait variants, the held-out set $\opp'$, and the budget of the test with adaptive opponents (\cref{sec:confirm}).
+  \item \textbf{Adaptation.} The number of training seeds per round, drawn fresh in every round (\cref{sec:compile}); the number of control runs; the number of PPO iterations from $\pi_0$; training episodes of up to 120\,s; the weight $\beta_{\mathrm{KS}}$ (\cref{sec:adapt}); and the shaping ratio $\rho$, which is still open (\cref{sec:compile}).
+  \item \textbf{Evaluation.} The number of episodes that each adapted policy, each control policy and $\pi_0$ play against $\opp$, both teams taking the mean of their action distributions; episodes run for up to 300\,s, and benefit is scored at that cutoff.
   \item \textbf{Diagnosis.} The thresholds $\epsilon_g$ and $\epsilon_{\mathrm{KL}}$; 95\% bootstrap intervals.
   \item \textbf{Loop control.} $k_{\mathrm{conv}}$ and $k_{\mathrm{ret}}$; at most $n_{\mathrm{att}} = 3$ attempts per Coach step; a budget of $B$ training rounds per campaign.
   \item \textbf{Coach.} Temperature 0, thinking mode off, prefix caching off, constrained decoding against the schema of each call.
@@ -739,7 +779,7 @@ We report the curve per chain rather than as an aggregate: a chain whose accurac
 The metric does not depend on task performance or RL luck and can be recomputed for any Coach configuration on the same evidence.
 
 \paragraph{Condition specificity (zero GPU cost).}
-The trigger rate $\tau(C) = \E_{s\sim d^{\pi_0}}[g_C(s)]$ under frozen rollouts of the base policy measures how far $C$ has been narrowed.
+The trigger rate $\tau(C) = \E_{s\sim d^{\pi_0}}[g_C(s)]$ under frozen rollouts of the base policy against $\opp$ measures how far $C$ has been narrowed.
 A healthy chain shows decreasing $\tau(C)$ while the effect inside the condition remains significant.
 
 \paragraph{Operator usage and failures of reference checks.}
@@ -748,7 +788,7 @@ Failure rates of reference checks are compared across LLM backends.
 
 \paragraph{Guarding against excessive narrowing.}
 Narrowing taken to the extreme overfits: a condition shrunk to exactly the scenarios that happened to be tested shows a strong effect that does not generalize.
-Three defenses apply: the preference for minimal edits, deductive validation against all earlier evidence, and one confirmation run per converged chain on scenarios that did not participate in its refinement.
+Three defenses apply: the preference for minimal edits, deductive validation against all earlier evidence, and the confirmation of every converged rule against opponents that did not take part in its refinement (\cref{sec:confirm}).
 
 \subsection{Ablations}
 \label{sec:ablations}
@@ -774,6 +814,7 @@ No deduction & evidence replay removed & What is deductive validation worth? & n
 Order shuffle & evidence order permuted, fold rerun & Is path dependence refinement or a random walk? & no \\
 Chain index & fixed order, index as covariate & Does memory, or tactic simplicity, speed later chains? & no \\
 Matched tokens & equal reasoning budget across conditions & Do gains come only from longer context? & no \\
+Placebo shaping & potential of the same magnitude with content unrelated to the hypothesis (e.g.\ a permuted gate) & Is it this tactic, or any shaping of this size? & yes \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -810,8 +851,8 @@ Conclusions are conditional on the adaptation budget, the retention regularizer 
 
 \paragraph{Opponent dependence.}
 A converged condition is a statement about the environment \emph{and} the opponent pool.
-Without trait diversity it may encode one opponent's weaknesses.
-Pool composition is therefore part of every reported result.
+Trait variants reduce, and the held-out and adaptive opponents of \cref{sec:confirm} test, the risk that it encodes one opponent's weaknesses.
+Pool composition is still part of every reported result, and robustness to opponents that adapt without limit is not claimed.
 
 \paragraph{Prior knowledge.}
 LLMs have read extensive soccer literature, which may inflate zero-shot baselines.
@@ -873,8 +914,9 @@ A later line in the store with the same identifier may fill each of \code{object
 \end{lstlisting}
 
 \paragraph{EvidenceRecord.}
-Each quantity in \code{outcome} carries the estimate, its interval from the bootstrap over seeds and episodes, the raw direction and the direction relative to the hypothesis.
-The base policy, opponent pool and registry are identified by hash in the configuration of the campaign rather than in each record.
+Each quantity in \code{outcome} carries the estimate relative to the control, its interval from the bootstrap over seeds and episodes, the raw direction and the direction relative to the hypothesis; \code{per\_opponent} repeats the estimates for each member of $\opp$.
+The base policy, opponent pool, control runs and registry are identified by hash in the configuration of the campaign rather than in each record.
+Records of the confirmation of \cref{sec:confirm} have the same form, marked by \code{"confirmation": true}.
 \begin{lstlisting}[style=json]
 {
   "evidence_id": "R3", "round_id": 3, "hypothesis_id": "H-001.2",
@@ -886,11 +928,12 @@ The base policy, opponent pool and registry are identified by hash in the config
     "mediator":  { ..., "measure": "med_mean" },
     "benefit":   { ... },
     "per_seed_directions": { "execution": { "s9": "down", "s10": "up", "s11": "up" }, ... },
-    "kl_from_base": 0.06, "mean_gate": 0.27,
+    "per_opponent": { "pi0": { "execution": { ... }, ... }, "high_line": { ... }, ... },
+    "kl_from_base": 0.06, "kl_from_base_control": 0.05, "mean_gate": 0.27,
     "execution_metric": "team_width", "mediator_metric": "opp_width",
     "seeds": ["s9", "s10", "s11"], "paired": false, "benefit_cutoff_s": 300
   },
-  "diagnosis": "inconclusive",
+  "diagnosis": "inconclusive", "confirmation": false,
   "thresholds": { "eps_gate": 0.02, "eps_kl": 0.03 },
   "training_meta": { "produced_by": "loop", "seeds": [9, 10, 11],
                      "replicate_of": ["R1", "R2"], "lam": 8.45, ... }
